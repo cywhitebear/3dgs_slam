@@ -5,6 +5,12 @@ Gaussian Model definition for 3D Gaussian Splatting.
 import numpy as np
 import torch
 import torch.nn as nn
+import sys
+import os
+
+# Import SH utilities
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.sh_utils import RGB2SH
 
 
 class GaussianModel(nn.Module):
@@ -35,13 +41,15 @@ class GaussianModel(nn.Module):
         
         self.num_gaussians = num_points
     
-    def initialize_from_pointcloud(self, positions, colors):
+    def initialize_from_pointcloud(self, positions, colors, init_scale=0.01, init_opacity=0.5):
         """
         Initialize Gaussians from point cloud.
         
         Args:
             positions: (N, 3) numpy array or torch tensor of 3D positions
             colors: (N, 3) numpy array or torch tensor of RGB colors in [0, 1]
+            init_scale: Initial scale for Gaussians (smaller = finer detail)
+            init_opacity: Initial opacity [0, 1] (will be converted to logit space internally)
         """
         # Convert to torch tensors if needed
         if isinstance(positions, torch.Tensor):
@@ -54,17 +62,24 @@ class GaussianModel(nn.Module):
         else:
             colors_t = torch.from_numpy(colors).float()
         
+        # Ensure colors are in [0, 1]
+        colors_t = torch.clamp(colors_t, 0, 1)
+        
         with torch.no_grad():
             # Positions
             self._xyz.data = positions_t
             
-            # Colors (convert to SH representation, storing DC component)
-            # DC component is the mean color
-            self._features_dc.data = colors_t.unsqueeze(1)
+            # Colors (DC component in SH space)
+            # CRITICAL: Apply RGB2SH transformation to convert RGB to SH DC space
+            # This is required for correct color interpretation by viewers
+            # DC = (RGB - 0.5) / 0.28209479 (SH basis normalization constant)
+            colors_sh = RGB2SH(colors_t)  # Transform RGB → SH DC space
+            self._features_dc.data = colors_sh.unsqueeze(1)
             
-            # Initialize scales (small fixed size)
+            # Initialize scales (small fixed size, learnable)
             # Use log scale: scale = exp(log_scale)
-            init_scale = 0.1
+            # Smaller values = finer details
+            # Try init_scale=0.01 for small, 0.05 for medium, 0.1 for large
             self._scaling.data = torch.ones((len(positions_t), 3), dtype=torch.float32, 
                                             device=positions_t.device) * np.log(init_scale)
             
@@ -73,9 +88,14 @@ class GaussianModel(nn.Module):
                                              device=positions_t.device)
             self._rotation.data[:, 3] = 1.0
             
-            # Initialize opacity (logit space, 0.5 -> logit 0)
-            self._opacity.data = torch.zeros((len(positions_t), 1), dtype=torch.float32,
-                                            device=positions_t.device)
+            # Initialize opacity (logit space)
+            # Convert desired opacity [0, 1] to logit space for optimization
+            # logit(x) = log(x / (1-x))
+            # Clamp to avoid log(0) or log(inf)
+            init_opacity = np.clip(init_opacity, 0.001, 0.999)
+            logit_opacity = np.log(init_opacity / (1 - init_opacity))
+            self._opacity.data = torch.ones((len(positions_t), 1), dtype=torch.float32,
+                                           device=positions_t.device) * logit_opacity
     
     def get_xyz(self):
         """Get position parameters."""

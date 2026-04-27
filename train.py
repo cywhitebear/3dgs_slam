@@ -94,7 +94,14 @@ class Trainer:
         points, colors = self.dataset.get_pointcloud()
         points = points.to(self.device)
         colors = colors.to(self.device)
-        self.gaussians.initialize_from_pointcloud(points, colors)
+        
+        # Initialize Gaussians with configurable scale and opacity
+        # Smaller init_scale = finer details, but takes longer to train
+        # Suggested values: 0.01 (very small), 0.05 (small), 0.1 (medium)
+        # init_opacity: 0-1 range for initial opacity (0.1=barely visible, 0.5=half, 0.9=mostly opaque)
+        init_scale = self.config.get('init_scale', 0.01)
+        init_opacity = self.config.get('init_opacity', 0.5)
+        self.gaussians.initialize_from_pointcloud(points, colors, init_scale=init_scale, init_opacity=init_opacity)
         
         print(f"[Trainer] Initialized {self.gaussians.num_gaussians} Gaussians")
         
@@ -328,55 +335,123 @@ class Trainer:
         print(f"[Trainer] Saved checkpoint to {checkpoint_path}")
     
     def save_gaussians_as_ply(self, filename="gaussians.ply"):
-        """Save trained Gaussians as PLY point cloud with all attributes."""
-        try:
-            import open3d as o3d
-        except ImportError:
-            print("[Trainer] open3d not installed, skipping PLY save")
-            return
+        """
+        Save trained Gaussians as binary PLY in standard 3DGS format.
+        Compatible with 3DGS viewers (e.g., https://www.3dgsviewers.com/)
+        
+        IMPORTANT: Parameter spaces in the PLY file:
+        - xyz: World coordinates (direct values)
+        - scales: LOG-SPACE (stored as _scaling = log(actual_scale))
+        - opacities: LOGIT-SPACE (stored as _opacity = log(opacity/(1-opacity)))
+        - rotations: Normalized quaternions
+        - colors_dc: Direct RGB values [0, 1]
+        - colors_rest: SH coefficients (can be negative)
+        
+        These are the LEARNED parameters, not the transformed ones.
+        The viewer will apply exp() and sigmoid() to recover actual values.
+        """
+        import struct
         
         # Extract Gaussian parameters
-        xyz = self.gaussians.get_xyz().detach().cpu().numpy()          # (N, 3)
-        colors = self.gaussians.get_colors_dc().squeeze(1).detach().cpu().numpy()  # (N, 3)
-        scales = self.gaussians.get_scaling().detach().cpu().numpy()   # (N, 3)
-        opacities = self.gaussians.get_opacity().squeeze(-1).detach().cpu().numpy()  # (N,)
-        rotations = self.gaussians.get_rotation().detach().cpu().numpy()  # (N, 4)
+        xyz = self.gaussians.get_xyz().detach().cpu().numpy()                    # (N, 3)
+        colors_dc = self.gaussians.get_colors_dc().squeeze(1).detach().cpu().numpy()   # (N, 3)
+        colors_rest = self.gaussians.get_colors_rest().detach().cpu().numpy()    # (N, 15, 3)
+        scales = self.gaussians._scaling.detach().cpu().numpy()                  # (N, 3) - log-scales!
+        opacities = self.gaussians._opacity.squeeze(-1).detach().cpu().numpy()   # (N,) - logit-space opacity!
+        rotations = self.gaussians.get_rotation().detach().cpu().numpy()         # (N, 4) - normalized quaternions
         
-        # Clamp colors to valid range
-        colors = np.clip(colors, 0, 1)
+        num_points = len(xyz)
         
-        # Create point cloud with positions and colors
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(xyz)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
+        # NOTE: DC and rest are in SPHERICAL HARMONICS space, NOT RGB!
+        # They can be negative and outside [0, 1] range. DO NOT CLIP!
+        # The viewer will apply SH2RGB transformation to recover proper colors.
+        # Only positions and opacities are bounded:
+        # - positions: unlimited (world coordinates)
+        # - opacities: stored in logit space (unlimited)
         
-        # Save to PLY
+        # Compute normals from rotation (use z-axis of rotation matrix)
+        # For now, use simplified normals based on rotation
+        normals = np.zeros((num_points, 3), dtype=np.float32)
+        # Simple approach: use rotation to compute a normal direction
+        for i in range(num_points):
+            # Extract rotation matrix from quaternion
+            q = rotations[i]  # [qx, qy, qz, qw]
+            qw, qx, qy, qz = q[3], q[0], q[1], q[2]
+            
+            # Compute z-axis of rotation matrix: 2*(qx*qz - qw*qy), 2*(qy*qz + qw*qx), 1 - 2*(qx^2 + qy^2)
+            nz = np.array([
+                2 * (qx * qz - qw * qy),
+                2 * (qy * qz + qw * qx),
+                1 - 2 * (qx**2 + qy**2)
+            ], dtype=np.float32)
+            normals[i] = nz / (np.linalg.norm(nz) + 1e-8)
+        
+        # Flatten SH rest coefficients (15 components × 3 channels = 45 values)
+        colors_rest_flat = colors_rest.reshape(num_points, -1)  # (N, 45)
+        
         ply_path = self.output_dir / filename
-        o3d.io.write_point_cloud(str(ply_path), pcd)
         
-        # Also save metadata with scales, opacities, and rotations
-        import json
-        metadata = {
-            'num_gaussians': len(xyz),
-            'scales_mean': scales.mean(axis=0).tolist(),
-            'opacities_mean': float(opacities.mean()),
-            'opacities_min': float(opacities.min()),
-            'opacities_max': float(opacities.max()),
-            'scales_range': {
-                'min': scales.min(axis=0).tolist(),
-                'max': scales.max(axis=0).tolist()
-            }
-        }
+        # Write binary PLY
+        with open(ply_path, 'wb') as f:
+            # Write header
+            header = f"""ply
+format binary_little_endian 1.0
+element vertex {num_points}
+property float x
+property float y
+property float z
+property float nx
+property float ny
+property float nz
+property float f_dc_0
+property float f_dc_1
+property float f_dc_2
+"""
+            # Add f_rest properties (45 values: f_rest_0 to f_rest_44)
+            for i in range(45):
+                header += f"property float f_rest_{i}\n"
+            
+            header += """property float opacity
+property float scale_0
+property float scale_1
+property float scale_2
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
+end_header
+"""
+            f.write(header.encode('utf-8'))
+            
+            # Write binary data
+            for i in range(num_points):
+                # Position
+                f.write(struct.pack('fff', xyz[i, 0], xyz[i, 1], xyz[i, 2]))
+                
+                # Normal
+                f.write(struct.pack('fff', normals[i, 0], normals[i, 1], normals[i, 2]))
+                
+                # DC color
+                f.write(struct.pack('fff', colors_dc[i, 0], colors_dc[i, 1], colors_dc[i, 2]))
+                
+                # Rest of SH components (45 floats)
+                for j in range(45):
+                    f.write(struct.pack('f', colors_rest_flat[i, j]))
+                
+                # Opacity
+                f.write(struct.pack('f', opacities[i]))
+                
+                # Scale
+                f.write(struct.pack('fff', scales[i, 0], scales[i, 1], scales[i, 2]))
+                
+                # Rotation quaternion
+                f.write(struct.pack('ffff', rotations[i, 0], rotations[i, 1], rotations[i, 2], rotations[i, 3]))
         
-        metadata_path = self.output_dir / filename.replace('.ply', '_metadata.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        print(f"[Trainer] Saved Gaussians to {ply_path}")
-        print(f"[Trainer] Metadata saved to {metadata_path}")
-        print(f"[Trainer]   - Points: {len(xyz)}")
+        print(f"[Trainer] Saved Gaussians to {ply_path} in 3DGS format")
+        print(f"[Trainer]   - Points: {num_points}")
         print(f"[Trainer]   - Opacity range: [{opacities.min():.3f}, {opacities.max():.3f}]")
         print(f"[Trainer]   - Scale range: [{scales.min():.3f}, {scales.max():.3f}]")
+        print(f"[Trainer] This PLY is compatible with 3DGS viewers")
 
 
 def main():
@@ -403,6 +478,8 @@ def main():
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 10,
+        'init_scale': 0.01,           # Initial Gaussian size in meters (0.01=1cm, 0.05=5cm, 0.1=10cm)
+        'init_opacity': 0.5,          # Initial opacity (0-1, passed through sigmoid in logit space)
     }
     
     # Create trainer and run

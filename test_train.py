@@ -23,6 +23,8 @@ def main():
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 5,
+        'init_scale': 0.2,       # Initial Gaussian size: 0.01 (small), 0.05 (medium), 0.1 (large)
+        'init_opacity': 0.5,      # Initial opacity: 0.1 (barely visible), 0.5 (half), 0.9 (mostly opaque)
     }
     
     print("=" * 60)
@@ -33,8 +35,8 @@ def main():
     trainer = Trainer(data_dir, output_dir, config, force_cpu=False)
     
     # Run quick test training
-    print("\n[Test] Running 5 epochs with batch_size=8...")
-    trainer.train(num_epochs=5, batch_size=8)
+    print("\n[Test] Running 0 epochs with batch_size=8...")
+    trainer.train(num_epochs=0, batch_size=8)
     
     # Save trained Gaussians as PLY
     trainer.save_gaussians_as_ply("gaussian_reconstruction.ply")
