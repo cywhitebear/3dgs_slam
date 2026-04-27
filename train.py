@@ -1,7 +1,32 @@
 """
 3D Gaussian Splatting Training Script.
 
-Initializes Gaussians from point cloud and trains with gsplat.
+Complete 3DGS training pipeline:
+1. INITIALIZATION: All point cloud points → Learnable 3D Gaussians
+   - Position: from point cloud coordinates
+   - Color: from point cloud RGB
+   - Scale: fixed initial size (0.1), learnable
+   - Rotation: identity quaternion, learnable
+   - Opacity: 0.5 (logit space), learnable
+
+2. RENDERING (per batch):
+   - Project 3D Gaussians to 2D using camera pose (world-to-camera) and intrinsics
+   - Rasterize 2D Gaussians to image via gsplat differentiable splatting
+   - Output: differentiable image with gradient flow
+
+3. LOSS & OPTIMIZATION:
+   - L1 loss between rendered image and ground truth
+   - Backward pass: compute gradients for all Gaussian parameters
+   - Adam optimizer: update position, color, scale, rotation, opacity
+   - Learning rate decay: exponential decay per epoch
+
+4. DENSITY CONTROL:
+   - Prune low-opacity Gaussians (< 0.005) that don't contribute
+   - Reduces parameters while maintaining quality
+
+5. OUTPUT:
+   - Checkpoints: Full model state with all parameters
+   - PLY file: Point cloud with positions, colors, and metadata
 """
 
 import os
@@ -116,26 +141,30 @@ class Trainer:
         from gsplat.rendering import rasterization
         
         # Get Gaussian parameters
-        means = self.gaussians.get_xyz()  # (N, 3)
-        quats = self.gaussians.get_rotation()  # (N, 4)
-        scales = self.gaussians.get_scaling()  # (N, 3)
-        opacities = self.gaussians.get_opacity().squeeze(-1)  # (N,) - squeeze to 1D
-        colors = self.gaussians.get_colors_dc()  # (N, 1, 3)
+        means = self.gaussians.get_xyz()  # (N, 3) - world space
+        quats = self.gaussians.get_rotation()  # (N, 4) - normalized quaternions
+        scales = self.gaussians.get_scaling()  # (N, 3) - exponentiated scales
+        opacities = self.gaussians.get_opacity().squeeze(-1)  # (N,) - sigmoid applied
+        colors = self.gaussians.get_colors_dc()  # (N, 1, 3) - DC SH component
         
-        # Prepare for gsplat
-        viewmat = pose_c2w.unsqueeze(0)  # (1, 4, 4)
+        # Convert camera pose: c2w -> w2c (world to camera)
+        # gsplat expects viewmats as world-to-camera transformation
+        pose_w2c = torch.linalg.inv(pose_c2w)
+        
+        # Prepare for gsplat (batch size = 1)
+        viewmat = pose_w2c.unsqueeze(0)  # (1, 4, 4)
         K_batch = K.unsqueeze(0)  # (1, 3, 3)
         
         # Render using gsplat
         try:
             image, alpha, info = rasterization(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,  # Now (N,) as expected by gsplat
-                colors=colors.squeeze(1),  # (N, 3)
-                viewmats=viewmat,
-                Ks=K_batch,
+                means=means,                    # (N, 3) in world space
+                quats=quats,                    # (N, 4) normalized quaternions
+                scales=scales,                  # (N, 3) positive scales
+                opacities=opacities,            # (N,) in [0, 1]
+                colors=colors.squeeze(1),       # (N, 3) RGB values
+                viewmats=viewmat,               # (1, 4, 4) world-to-camera
+                Ks=K_batch,                     # (1, 3, 3) intrinsics
                 width=image_width,
                 height=image_height,
                 near_plane=0.01,
@@ -192,7 +221,51 @@ class Trainer:
         total_loss.backward()
         self.optimizer.step()
         
+        # Density control: prune low opacity Gaussians
+        self.prune_low_opacity_gaussians(opacity_threshold=0.005)
+        
         return total_loss.item()
+    
+    def prune_low_opacity_gaussians(self, opacity_threshold=0.005):
+        """
+        Remove Gaussians with opacity below threshold.
+        These Gaussians contribute negligibly to the final image.
+        
+        Args:
+            opacity_threshold: Opacity threshold for pruning
+        """
+        with torch.no_grad():
+            opacities = self.gaussians.get_opacity().squeeze(-1)  # (N,)
+            
+            # Find Gaussians to keep
+            mask = opacities > opacity_threshold
+            num_to_remove = (~mask).sum().item()
+            
+            if num_to_remove > 0:
+                # Keep only high-opacity Gaussians
+                self.gaussians._xyz.data = self.gaussians._xyz.data[mask]
+                self.gaussians._features_dc.data = self.gaussians._features_dc.data[mask]
+                self.gaussians._features_rest.data = self.gaussians._features_rest.data[mask]
+                self.gaussians._scaling.data = self.gaussians._scaling.data[mask]
+                self.gaussians._rotation.data = self.gaussians._rotation.data[mask]
+                self.gaussians._opacity.data = self.gaussians._opacity.data[mask]
+                
+                # Update optimizer to remove pruned parameters
+                # Reset optimizer state for new parameter set
+                self.optimizer = Adam([
+                    {'params': [self.gaussians._xyz], 'lr': self.config['lr_xyz']},
+                    {'params': [self.gaussians._features_dc], 'lr': self.config['lr_color']},
+                    {'params': [self.gaussians._features_rest], 'lr': self.config['lr_color']},
+                    {'params': [self.gaussians._opacity], 'lr': self.config['lr_opacity']},
+                    {'params': [self.gaussians._scaling], 'lr': self.config['lr_scaling']},
+                    {'params': [self.gaussians._rotation], 'lr': self.config['lr_rotation']},
+                ], lr=0.0)
+                
+                self.gaussians.num_gaussians = len(self.gaussians._xyz)
+                
+                if self.iteration % 100 == 0:
+                    print(f"[Density Control] Pruned {num_to_remove} low-opacity Gaussians at iteration {self.iteration}")
+
     
     def train(self, num_epochs, batch_size=4):
         """
@@ -255,7 +328,7 @@ class Trainer:
         print(f"[Trainer] Saved checkpoint to {checkpoint_path}")
     
     def save_gaussians_as_ply(self, filename="gaussians.ply"):
-        """Save trained Gaussians as PLY point cloud."""
+        """Save trained Gaussians as PLY point cloud with all attributes."""
         try:
             import open3d as o3d
         except ImportError:
@@ -263,21 +336,47 @@ class Trainer:
             return
         
         # Extract Gaussian parameters
-        xyz = self.gaussians.get_xyz().detach().cpu().numpy()
-        colors = self.gaussians.get_colors_dc().squeeze(1).detach().cpu().numpy()
+        xyz = self.gaussians.get_xyz().detach().cpu().numpy()          # (N, 3)
+        colors = self.gaussians.get_colors_dc().squeeze(1).detach().cpu().numpy()  # (N, 3)
+        scales = self.gaussians.get_scaling().detach().cpu().numpy()   # (N, 3)
+        opacities = self.gaussians.get_opacity().squeeze(-1).detach().cpu().numpy()  # (N,)
+        rotations = self.gaussians.get_rotation().detach().cpu().numpy()  # (N, 4)
         
         # Clamp colors to valid range
         colors = np.clip(colors, 0, 1)
         
-        # Create point cloud
+        # Create point cloud with positions and colors
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.colors = o3d.utility.Vector3dVector(colors)
         
-        # Save
+        # Save to PLY
         ply_path = self.output_dir / filename
         o3d.io.write_point_cloud(str(ply_path), pcd)
+        
+        # Also save metadata with scales, opacities, and rotations
+        import json
+        metadata = {
+            'num_gaussians': len(xyz),
+            'scales_mean': scales.mean(axis=0).tolist(),
+            'opacities_mean': float(opacities.mean()),
+            'opacities_min': float(opacities.min()),
+            'opacities_max': float(opacities.max()),
+            'scales_range': {
+                'min': scales.min(axis=0).tolist(),
+                'max': scales.max(axis=0).tolist()
+            }
+        }
+        
+        metadata_path = self.output_dir / filename.replace('.ply', '_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
         print(f"[Trainer] Saved Gaussians to {ply_path}")
+        print(f"[Trainer] Metadata saved to {metadata_path}")
+        print(f"[Trainer]   - Points: {len(xyz)}")
+        print(f"[Trainer]   - Opacity range: [{opacities.min():.3f}, {opacities.max():.3f}]")
+        print(f"[Trainer]   - Scale range: [{scales.min():.3f}, {scales.max():.3f}]")
 
 
 def main():
