@@ -26,6 +26,42 @@ from scene.dataset_readers import Dataset
 from utils.general_utils import mkdir_p
 from utils.sh_utils import RGB2SH
 
+from math import exp
+
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+def create_window(window_size, channel):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+def ssim(img1, img2, window_size=11, size_average=True):
+    channel = img1.size(-3)
+    window = create_window(window_size, channel).to(img1.device)
+    
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    if size_average:
+        return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
 
 def create_gaussians_with_optimizers(
     points: torch.Tensor,
@@ -188,9 +224,9 @@ class Trainer:
         # Setup strategy
         self.strategy = DefaultStrategy(
             prune_opa=config.get('prune_opa', 0.005),
-            grow_grad2d=config.get('grow_grad2d', 0.0002),
+            grow_grad2d=config.get('grow_grad2d', 0.0001),
             grow_scale3d=config.get('grow_scale3d', 0.01),
-            grow_scale2d=config.get('grow_scale2d', 0.05),
+            grow_scale2d=config.get('grow_scale2d', 0.005),
             prune_scale3d=config.get('prune_scale3d', 0.15),
             prune_scale2d=config.get('prune_scale2d', 0.15),
             refine_start_iter=config.get('refine_start_iter', 500),
@@ -257,11 +293,15 @@ class Trainer:
         
         total_loss = 0.0
         num_frames = len(frame_indices)
+        lambda_ssim = self.config.get('lambda_ssim', 0.2)
         
         # Render all frames in batch
         for frame_idx in frame_indices:
             target_image = self.dataset.get_image(frame_idx)  # [3, H, W]
             target_image = target_image.to(self.device)
+            mask = self.dataset.get_mask(frame_idx).to(self.device)
+            # Mask: 0 for objects (keep), 255 for sky (ignore)
+            loss_mask = (mask == 0).float().unsqueeze(0)
             
             pose_c2w = self.poses_c2w[frame_idx]
             
@@ -273,8 +313,16 @@ class Trainer:
                 self.dataset.image_height,
             )
             
-            # Loss
-            loss = F.l1_loss(rendered, target_image)
+            # Apply mask to images before loss calculation
+            masked_render = rendered * loss_mask
+            masked_target = target_image * loss_mask
+            
+            # Combined Loss Calculation
+            l1_val = F.l1_loss(masked_render, masked_target)
+            ssim_val = ssim(masked_render.unsqueeze(0), masked_target.unsqueeze(0))
+            
+            # Total Loss = (1 - lambda) * L1 + lambda * (1 - SSIM)
+            loss = (1.0 - lambda_ssim) * l1_val + lambda_ssim * (1.0 - ssim_val)
             total_loss += loss
         
         total_loss = total_loss / num_frames
@@ -421,17 +469,18 @@ if __name__ == "__main__":
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 20,
-        'init_scale': 0.1,  # Fixed size in meters
+        'init_scale': 0.15,  # Fixed size in meters
         'init_opacity': 0.5,
         'refine_start_iter': 999,  # Start densification at iteration x
         'refine_stop_iter': 6001,  # Stop densification at iteration x
         'refine_every': 100,  # Densify every x iterations
+        'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
     output_dir = "output_v2"
     
     trainer = Trainer(data_dir, output_dir, config)
-    trainer.train(num_epochs=0, batch_size=8)
+    trainer.train(num_epochs=10, batch_size=8)
     trainer.save_ply("gaussian_reconstruction_v2.ply")
     print("\nTraining complete!")
