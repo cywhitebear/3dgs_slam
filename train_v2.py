@@ -255,45 +255,57 @@ class Trainer:
         self.iteration = 0
     
     def rasterize_splats(self, camtoworld: torch.Tensor, K: torch.Tensor, width: int, height: int):
-        """Render a single image."""
-        means = self.splats["means"]  # [N, 3]
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"]).squeeze(-1)  # [N]
-        sh0 = self.splats["sh0"]  # [N, 1, 3]
+        means = self.splats["means"]
+        quats = self.splats["quats"]
+        scales = torch.exp(self.splats["scales"])
+        opacities = torch.sigmoid(self.splats["opacities"]).squeeze(-1)
         
-        # Combine colors
-        colors = sh0  # [N, 1, 3]
+        # 1. Calculate the depth of each Gaussian in camera space
+        viewmat = torch.linalg.inv(camtoworld) # [4, 4]
+        # Transform means to camera space: P_cam = R*P_world + t
+        # We only need the Z-component (depth)
+        means_h = torch.cat([means, torch.ones((means.shape[0], 1), device=self.device)], dim=-1)
+        p_cam = (viewmat @ means_h.T).T
+        gauss_depths = p_cam[:, 2:3] # [N, 1]
+
+        # 2. Combine RGB (from SH) and Depth into a 4-channel 'color' tensor
+        # C0 is the standard SH constant (1 / (2 * sqrt(pi)))
+        C0 = 0.28209479177387814
+        sh0 = self.splats["sh0"].squeeze(1) # [N, 3]
+        rgb = sh0 * C0 + 0.5
+        render_features = torch.cat([rgb, gauss_depths], dim=-1) # [N, 4]
         
-        # World-to-camera transformation
-        viewmat = torch.linalg.inv(camtoworld).unsqueeze(0)  # [1, 4, 4]
-        K_batch = K.unsqueeze(0)  # [1, 3, 3]
+        # 3. Render
+        K_batch = K.unsqueeze(0)
+        viewmat_batch = viewmat.unsqueeze(0)
         
-        # Render
-        render_colors, render_alphas, info = rasterization(
+        render_features, render_alphas, info = rasterization(
             means=means,
             quats=quats,
             scales=scales,
             opacities=opacities,
-            colors=colors.squeeze(1),  # [N, 3]
-            viewmats=viewmat,
+            colors=render_features, # Pass 4 channels [RGB + Depth]
+            viewmats=viewmat_batch,
             Ks=K_batch,
             width=width,
             height=height,
-            packed=True,
+            packed=False,
             near_plane=0.01,
-            far_plane=100.0,
+            far_plane=1000.0, # CRITICAL: Increase for sky coverage
         )
         
-        # render_colors: [1, H, W, 3] (pre-multiplied RGB)
-        # render_alphas: [1, H, W, 1] (accumulated alpha)
-        # Composite with black background
-        background = torch.zeros_like(render_colors)
-        image = render_colors + (1.0 - render_alphas) * background  # [1, H, W, 3]
-        image = image.squeeze(0).permute(2, 0, 1)  # [3, H, W]
         self.last_info = info
         
-        return image
+        # 4. Separate RGB and Depth
+        # render_features is [1, H, W, 4]
+        image_rgb = render_features[0, ..., :3]
+        image_depth = render_features[0, ..., 3] # This is your [H, W] rendered depth
+        
+        # Composite with background
+        image_rgb = image_rgb + (1.0 - render_alphas[0]) * 0.0 # Black background
+        
+        # Return both for the train_step to use
+        return image_rgb.permute(2, 0, 1), image_depth
     
     def train_step(self, frame_indices: np.ndarray) -> float:
         """Run one training step."""
@@ -304,6 +316,7 @@ class Trainer:
         total_loss = 0.0
         num_frames = len(frame_indices)
         lambda_ssim = self.config.get('lambda_ssim', 0.2)
+        lambda_depth = self.config.get('lambda_depth', 0.1)
         
         # Render all frames in batch
         for frame_idx in frame_indices:
@@ -316,15 +329,26 @@ class Trainer:
             pose_c2w = self.poses_c2w[frame_idx]
             
             # Render
-            rendered = self.rasterize_splats(
+            rendered_rgb, rendered_depth = self.rasterize_splats(
                 pose_c2w,
                 self.K,
                 self.dataset.image_width,
                 self.dataset.image_height,
             )
             
+            # Depth Loss
+            # Assuming your Dataset.get_lidar_depth returns [H, W]
+            lidar_depth = self.dataset.get_lidar_depth(frame_idx, device=self.device)
+            
+            valid_depth_mask = (lidar_depth > 0)
+            if valid_depth_mask.any():
+                # Both are now [H, W] or filtered to 1D
+                depth_loss_val = F.l1_loss(rendered_depth[valid_depth_mask], lidar_depth[valid_depth_mask])
+            else:
+                depth_loss_val = torch.tensor(0.0).to(self.device)
+
             # Apply mask to images before loss calculation
-            masked_render = rendered * loss_mask
+            masked_render = rendered_rgb * loss_mask
             masked_target = target_image * loss_mask
             
             # Combined Loss Calculation
@@ -332,7 +356,7 @@ class Trainer:
             ssim_val = ssim(masked_render.unsqueeze(0), masked_target.unsqueeze(0))
             
             # Total Loss = (1 - lambda) * L1 + lambda * (1 - SSIM)
-            loss = (1.0 - lambda_ssim) * l1_val + lambda_ssim * (1.0 - ssim_val)
+            loss = (1.0 - lambda_ssim) * l1_val + lambda_ssim * (1.0 - ssim_val) + lambda_depth * depth_loss_val
             total_loss += loss
         
         total_loss = total_loss / num_frames
@@ -360,7 +384,7 @@ class Trainer:
             state=self.strategy_state,
             step=self.iteration,
             info=self.last_info,
-            packed=True,
+            packed=False,
         )
         
         return total_loss.item()
@@ -481,17 +505,18 @@ if __name__ == "__main__":
         'checkpoint_interval': 20,
         'init_scale_lidar': 0.15,    # Size in meters for LiDAR points
         'init_scale_sky': 0.5,
-        'init_opacity': 0.5,
+        'init_opacity': 0.7,
         'refine_start_iter': 199,  # Start densification at iteration x
         'refine_stop_iter': 6001,  # Stop densification at iteration x
-        'refine_every': 200,  # Densify every x iterations
-        'lambda_ssim': 0.3,  # Weight for SSIM loss (x SSIM, 1-x L1)
+        'refine_every': 100,  # Densify every x iterations
+        'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
+        'lambda_depth': 0.1,  # Weight for depth loss
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
     output_dir = "output_v2"
     
     trainer = Trainer(data_dir, output_dir, config)
-    trainer.train(num_epochs=10, batch_size=8)
+    trainer.train(num_epochs=5, batch_size=8)
     trainer.save_ply("gaussian_reconstruction_v2.ply")
     print("\nTraining complete!")
