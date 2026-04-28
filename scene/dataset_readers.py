@@ -28,12 +28,14 @@ class Dataset:
         self.poses_file = self.data_dir / "camera_gt_pose.txt"
         self.intrinsics_file = self.data_dir / "camera_intrinsics.json"
         self.pointcloud_file = self.data_dir / "itri58_full_color_map.pcd"
+        self.mask_dir = self.data_dir / "sky_masks"
         
         # Load data
         self._load_poses()
         self._load_intrinsics()
         self._load_image_list()
         self._load_pointcloud()
+        self._load_mask_list()
     
     def _load_poses(self):
         """Load camera poses from file."""
@@ -79,6 +81,11 @@ class Dataset:
         self.points_map = np.asarray(pcd.points, dtype=np.float32)
         self.colors_map = np.asarray(pcd.colors, dtype=np.float32)
         print(f"[Dataset] Loaded point cloud with {len(self.points_map)} points")
+
+    def _load_mask_list(self):
+        """Pre-check mask availability."""
+        self.mask_filenames = sorted(os.listdir(self.mask_dir))
+        print(f"[Dataset] Found {len(self.mask_filenames)} sky masks")
     
     def get_poses_torch(self):
         """Get poses as torch tensors (c2w matrices)."""
@@ -138,7 +145,15 @@ class Dataset:
         points = torch.from_numpy(self.points_map).float()
         colors = torch.from_numpy(self.colors_map).float()
         return points, colors
-    
+
+    def get_mask(self, frame_idx):
+        """Load a single binary sky mask."""
+        mask_path = self.mask_dir / self.image_filenames[frame_idx].replace(".jpg", ".png").replace(".jpeg", ".png")
+        if not mask_path.exists():
+            return None
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        return torch.from_numpy(mask) # (H, W)
+
     def __len__(self):
         """Get number of frames."""
         return len(self.poses)

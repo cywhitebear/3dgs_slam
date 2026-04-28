@@ -91,6 +91,43 @@ def create_gaussians_with_optimizers(
     
     return splats, optimizers
 
+def generate_sky_points(dataset, num_points=100000, depth_range=(50.0, 80.0), device="cuda"):
+    """Generates 3D points for sky regions using unprojection."""
+    all_points = []
+    all_colors = []
+    
+    # Sample from frames to ensure coverage
+    indices = np.linspace(0, len(dataset)-1, 100, dtype=int)
+    K_inv = torch.inverse(dataset.get_intrinsics_torch().to(device))
+    
+    for idx in indices:
+        mask = dataset.get_mask(idx)
+        if mask is None: continue
+        
+        image = dataset.get_image(idx).to(device)
+        pose_c2w = dataset.get_poses_torch()[idx].to(device)
+        
+        # Identify sky pixels
+        sky_coords = torch.where(mask == 255)
+        if len(sky_coords[0]) == 0: continue
+        
+        # Sample points from the sky
+        num_to_sample = num_points // len(indices)
+        sel = torch.randint(0, len(sky_coords[0]), (num_to_sample,))
+        y, x = sky_coords[0][sel].to(device), sky_coords[1][sel].to(device)
+        
+        # Random depth initialization
+        depths = torch.rand(num_to_sample, device=device) * (depth_range[1] - depth_range[0]) + depth_range[0]
+        
+        # Unproject: P_world = R * (K_inv * p_pix * depth) + t
+        pix_h = torch.stack([x.float(), y.float(), torch.ones_like(x).float()], dim=-1)
+        p_cam = (K_inv @ pix_h.unsqueeze(-1)).squeeze(-1) * depths.unsqueeze(-1)
+        p_world = (pose_c2w[:3, :3] @ p_cam.unsqueeze(-1)).squeeze(-1) + pose_c2w[:3, 3]
+        
+        all_points.append(p_world)
+        all_colors.append(image[:, y, x].T)
+
+    return torch.cat(all_points), torch.cat(all_colors)
 
 class Trainer:
     """3DGS Trainer following gsplat official pattern."""
@@ -119,13 +156,21 @@ class Trainer:
         self.K = self.dataset.get_intrinsics_torch().to(self.device)
         
         print(f"[Trainer] Points: {len(points)}, Cameras: {len(self.poses_c2w)}")
+
+        # Add sky points at random depth
+        print("[Trainer] Initializing additional sky Gaussians...")
+        sky_p, sky_c = generate_sky_points(self.dataset, num_points=100000, device=self.device)
+
+        # Combine both sets
+        combined_p = torch.cat([points.to(self.device), sky_p], dim=0)
+        combined_c = torch.cat([colors.to(self.device), sky_c], dim=0)
         
         # Create Gaussians and optimizers
         init_scale = config.get('init_scale', 0.2)
         init_opacity = config.get('init_opacity', 0.5)
         self.splats, self.optimizers = create_gaussians_with_optimizers(
-            points=points,
-            rgbs=colors,
+            points=combined_p,
+            rgbs=combined_c,
             init_scale=init_scale,
             init_opacity=init_opacity,
             means_lr=config['lr_xyz'],
@@ -376,17 +421,17 @@ if __name__ == "__main__":
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 20,
-        'init_scale': 0.05,  # Fixed size in meters
+        'init_scale': 0.1,  # Fixed size in meters
         'init_opacity': 0.5,
         'refine_start_iter': 999,  # Start densification at iteration x
         'refine_stop_iter': 6001,  # Stop densification at iteration x
-        'refine_every': 1000,  # Densify every x iterations
+        'refine_every': 100,  # Densify every x iterations
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
     output_dir = "output_v2"
     
     trainer = Trainer(data_dir, output_dir, config)
-    trainer.train(num_epochs=40, batch_size=8)
+    trainer.train(num_epochs=0, batch_size=8)
     trainer.save_ply("gaussian_reconstruction_v2.ply")
     print("\nTraining complete!")
