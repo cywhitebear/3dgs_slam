@@ -84,9 +84,8 @@ class Dataset:
         """Get poses as torch tensors (c2w matrices)."""
         poses_list = []
         for pose in self.poses:
-            # Convert w2c to c2w
-            c2w = np.linalg.inv(pose)
-            poses_list.append(torch.from_numpy(c2w).float())
+            # Poses are already in c2w format (camera-to-world)
+            poses_list.append(torch.from_numpy(pose).float())
         return torch.stack(poses_list)  # (N, 4, 4)
     
     def get_intrinsics_torch(self):

@@ -146,7 +146,7 @@ class Trainer:
             grow_grad2d=config.get('grow_grad2d', 0.0002),
             grow_scale3d=config.get('grow_scale3d', 0.01),
             grow_scale2d=config.get('grow_scale2d', 0.05),
-            prune_scale3d=config.get('prune_scale3d', 0.1),
+            prune_scale3d=config.get('prune_scale3d', 0.15),
             prune_scale2d=config.get('prune_scale2d', 0.15),
             refine_start_iter=config.get('refine_start_iter', 500),
             refine_stop_iter=config.get('refine_stop_iter', 15000),
@@ -194,8 +194,12 @@ class Trainer:
             far_plane=100.0,
         )
         
-        # render_colors: [1, H, W, 3]
-        image = render_colors.squeeze(0).permute(2, 0, 1)  # [3, H, W]
+        # render_colors: [1, H, W, 3] (pre-multiplied RGB)
+        # render_alphas: [1, H, W, 1] (accumulated alpha)
+        # Composite with black background
+        background = torch.zeros_like(render_colors)
+        image = render_colors + (1.0 - render_alphas) * background  # [1, H, W, 3]
+        image = image.squeeze(0).permute(2, 0, 1)  # [3, H, W]
         self.last_info = info
         
         return image
@@ -371,18 +375,18 @@ if __name__ == "__main__":
         'lr_scaling': 0.005,
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
-        'checkpoint_interval': 5,
-        'init_scale': 0.2,  # Fixed size in meters
+        'checkpoint_interval': 20,
+        'init_scale': 0.05,  # Fixed size in meters
         'init_opacity': 0.5,
-        'refine_start_iter': 500,  # Start densification at iteration 500
-        'refine_stop_iter': 15000,  # Stop densification at iteration 15000
-        'refine_every': 100,  # Densify every 100 iterations
+        'refine_start_iter': 999,  # Start densification at iteration x
+        'refine_stop_iter': 6001,  # Stop densification at iteration x
+        'refine_every': 1000,  # Densify every x iterations
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
     output_dir = "output_v2"
     
     trainer = Trainer(data_dir, output_dir, config)
-    trainer.train(num_epochs=10, batch_size=8)
+    trainer.train(num_epochs=40, batch_size=8)
     trainer.save_ply("gaussian_reconstruction_v2.ply")
     print("\nTraining complete!")
