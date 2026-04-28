@@ -236,9 +236,9 @@ class Trainer:
             prune_opa=config.get('prune_opa', 0.005),
             grow_grad2d=config.get('grow_grad2d', 0.0001),
             grow_scale3d=config.get('grow_scale3d', 0.01),
-            grow_scale2d=config.get('grow_scale2d', 0.005),
+            grow_scale2d=config.get('grow_scale2d', 0.05),
             prune_scale3d=config.get('prune_scale3d', 0.15),
-            prune_scale2d=config.get('prune_scale2d', 0.2),
+            prune_scale2d=config.get('prune_scale2d', 0.15),
             refine_start_iter=config.get('refine_start_iter', 500),
             refine_stop_iter=config.get('refine_stop_iter', 15000),
             refine_every=config.get('refine_every', 100),
@@ -492,6 +492,42 @@ class Trainer:
         
         print(f"[Trainer] Saved PLY: {ply_path}")
 
+    def load_checkpoint(self, ckpt_path: str):
+        """Load a saved checkpoint and resume training."""
+        print(f"[Trainer] Loading checkpoint from: {ckpt_path}")
+        # Load the data to the current device
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        
+        # Restore the iteration count
+        self.iteration = checkpoint.get('iteration', 0)
+        
+        # Restore parameter data
+        # We wrap the saved tensors back into nn.Parameters to maintain gradient flow
+        splat_data = checkpoint['splats']
+        for k in self.splats.keys():
+            if k in splat_data:
+                self.splats[k] = nn.Parameter(splat_data[k].to(self.device))
+            else:
+                print(f"[Warning] Key {k} not found in checkpoint.")
+
+        # CRITICAL: Re-initialize optimizers 
+        # Old optimizers are tied to the memory addresses of the old parameters
+        self.optimizers = {
+            "means": Adam([{"params": self.splats["means"], "lr": self.config['lr_xyz']}], eps=1e-15),
+            "scales": Adam([{"params": self.splats["scales"], "lr": self.config['lr_scaling']}], eps=1e-15),
+            "quats": Adam([{"params": self.splats["quats"], "lr": self.config['lr_rotation']}], eps=1e-15),
+            "opacities": Adam([{"params": self.splats["opacities"], "lr": self.config['lr_opacity']}], eps=1e-15),
+            "sh0": Adam([{"params": self.splats["sh0"], "lr": self.config.get('lr_color', 2.5e-3)}], eps=1e-15),
+        }
+        
+        # Restore the scheduler state for the new 'means' optimizer
+        self.scheduler = ExponentialLR(self.optimizers["means"], gamma=self.config['lr_decay'])
+        # Step the scheduler up to the current iteration
+        for _ in range(self.iteration):
+            self.scheduler.step()
+            
+        print(f"[Trainer] Resuming from iteration {self.iteration}")
+
 
 if __name__ == "__main__":
     # Config
@@ -502,21 +538,27 @@ if __name__ == "__main__":
         'lr_scaling': 0.005,
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
-        'checkpoint_interval': 20,
+        'checkpoint_interval': 10,
         'init_scale_lidar': 0.15,    # Size in meters for LiDAR points
         'init_scale_sky': 0.5,
         'init_opacity': 0.7,
         'refine_start_iter': 199,  # Start densification at iteration x
-        'refine_stop_iter': 6001,  # Stop densification at iteration x
+        'refine_stop_iter': 2001,  # Stop densification at iteration x
         'refine_every': 100,  # Densify every x iterations
         'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
         'lambda_depth': 0.1,  # Weight for depth loss
+        'checkpoint_path': None, # Set to None if starting fresh
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
     output_dir = "output_v2"
     
     trainer = Trainer(data_dir, output_dir, config)
-    trainer.train(num_epochs=5, batch_size=8)
+
+    ckpt = config.get('checkpoint_path')
+    if ckpt and os.path.exists(ckpt):
+        trainer.load_checkpoint(ckpt)
+
+    trainer.train(num_epochs=20, batch_size=8)
     trainer.save_ply("gaussian_reconstruction_v2.ply")
     print("\nTraining complete!")
