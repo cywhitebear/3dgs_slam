@@ -10,6 +10,7 @@ build/
 data/
 output/
 output_test/
+output_v2/
 *.ply
 *.zip
 *.pt

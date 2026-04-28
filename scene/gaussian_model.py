@@ -122,5 +122,49 @@ class GaussianModel(nn.Module):
         """Get higher-order SH color components."""
         return self._features_rest
     
+    # Utility functions for parameter activation
+    # These convert from learned parameter space to actual values
+    scaling_activation = torch.exp
+    scaling_inverse_activation = torch.log
+    opacity_activation = torch.sigmoid
+    rotation_activation = lambda x: nn.functional.normalize(x, dim=1)
+    
+    def replace_parameters(self, new_params):
+        """
+        Replace parameters with new tensors after densification (split/clone/prune).
+        
+        This method safely updates all nn.Parameter attributes with new tensors
+        returned by strategy.refine(). It keeps them as learnable parameters
+        so gradients flow correctly and they remain registered with the module.
+        
+        Args:
+            new_params (dict): Dictionary with keys like 'means', 'scales', 'quats',
+                             'opacities', 'features_dc', 'features_rest'
+                             These tensors come from strategy.refine()
+        
+        Returns:
+            None (updates in-place)
+        """
+        with torch.no_grad():
+            # Map strategy parameter names to our internal names
+            param_mapping = {
+                'means': '_xyz',
+                'scales': '_scaling',
+                'quats': '_rotation',
+                'opacities': '_opacity',
+                'features_dc': '_features_dc',
+                'features_rest': '_features_rest',
+            }
+            
+            # Update each parameter, ensuring it remains an nn.Parameter
+            for strategy_name, internal_name in param_mapping.items():
+                if strategy_name in new_params:
+                    new_tensor = new_params[strategy_name]
+                    # Replace the parameter (wraps tensor as nn.Parameter automatically)
+                    setattr(self, internal_name, nn.Parameter(new_tensor))
+        
+        # Update gaussian count to reflect new population
+        self.num_gaussians = new_params['means'].shape[0]
+    
     def __repr__(self):
         return f"GaussianModel(num_gaussians={self.num_gaussians})"
