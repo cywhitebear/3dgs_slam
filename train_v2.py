@@ -66,7 +66,7 @@ def ssim(img1, img2, window_size=11, size_average=True):
 def create_gaussians_with_optimizers(
     points: torch.Tensor,
     rgbs: torch.Tensor,
-    init_scale: float = 0.2,
+    init_scales: torch.Tensor,
     init_opacity: float = 0.5,
     sh_degree: int = 0,  # 0 means only DC component (RGB colors)
     means_lr: float = 1.6e-4,
@@ -90,8 +90,9 @@ def create_gaussians_with_optimizers(
     # Initialize means (positions)
     means = points  # [N, 3]
     
-    # Initialize scales - fixed size in log space
-    scales = torch.ones((N, 3), device=device) * np.log(init_scale)  # [N, 3]
+    # Use the per-point scales and convert to log space
+    # gsplat expects scales in log space: s_log = log(s_actual)
+    scales = torch.log(init_scales.to(device))  # [N, 3]
     
     # Initialize rotations (identity quaternions: [0, 0, 0, 1])
     quats = torch.zeros((N, 4), device=device)
@@ -187,27 +188,36 @@ class Trainer:
         # Load dataset
         print("[Trainer] Loading dataset...")
         self.dataset = Dataset(data_dir)
-        points, colors = self.dataset.get_pointcloud()
+        # Pointcloud data
+        pc_points, pc_colors = self.dataset.get_pointcloud()
+        num_pc = pc_points.shape[0]
         self.poses_c2w = self.dataset.get_poses_torch().to(self.device)
         self.K = self.dataset.get_intrinsics_torch().to(self.device)
         
-        print(f"[Trainer] Points: {len(points)}, Cameras: {len(self.poses_c2w)}")
+        print(f"[Trainer] Points: {len(pc_points)}, Cameras: {len(self.poses_c2w)}")
 
         # Add sky points at random depth
         print("[Trainer] Initializing additional sky Gaussians...")
-        sky_p, sky_c = generate_sky_points(self.dataset, num_points=100000, device=self.device)
+        # Generate Sky data
+        sky_points, sky_colors = generate_sky_points(self.dataset, num_points=10000)
+        num_sky = sky_points.shape[0]
+
+        init_scale_lidar = config.get('init_scale_lidar', 0.1)
+        init_scale_sky = config.get('init_scale_sky', 10.0)
+        pc_scales = torch.ones((num_pc, 3)) * init_scale_lidar
+        sky_scales = torch.ones((num_sky, 3)) * init_scale_sky
 
         # Combine both sets
-        combined_p = torch.cat([points.to(self.device), sky_p], dim=0)
-        combined_c = torch.cat([colors.to(self.device), sky_c], dim=0)
+        combined_points = torch.cat([pc_points.to(self.device), sky_points], dim=0)
+        combined_colors = torch.cat([pc_colors.to(self.device), sky_colors], dim=0)
+        combined_scales = torch.cat([pc_scales, sky_scales], dim=0)
         
         # Create Gaussians and optimizers
-        init_scale = config.get('init_scale', 0.2)
         init_opacity = config.get('init_opacity', 0.5)
         self.splats, self.optimizers = create_gaussians_with_optimizers(
-            points=combined_p,
-            rgbs=combined_c,
-            init_scale=init_scale,
+            points=combined_points,
+            rgbs=combined_colors,
+            init_scales=combined_scales,
             init_opacity=init_opacity,
             means_lr=config['lr_xyz'],
             scale_lr=config['lr_scaling'],
@@ -228,7 +238,7 @@ class Trainer:
             grow_scale3d=config.get('grow_scale3d', 0.01),
             grow_scale2d=config.get('grow_scale2d', 0.005),
             prune_scale3d=config.get('prune_scale3d', 0.15),
-            prune_scale2d=config.get('prune_scale2d', 0.15),
+            prune_scale2d=config.get('prune_scale2d', 0.2),
             refine_start_iter=config.get('refine_start_iter', 500),
             refine_stop_iter=config.get('refine_stop_iter', 15000),
             refine_every=config.get('refine_every', 100),
@@ -469,12 +479,13 @@ if __name__ == "__main__":
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 20,
-        'init_scale': 0.15,  # Fixed size in meters
+        'init_scale_lidar': 0.15,    # Size in meters for LiDAR points
+        'init_scale_sky': 0.5,
         'init_opacity': 0.5,
-        'refine_start_iter': 999,  # Start densification at iteration x
+        'refine_start_iter': 199,  # Start densification at iteration x
         'refine_stop_iter': 6001,  # Stop densification at iteration x
-        'refine_every': 100,  # Densify every x iterations
-        'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
+        'refine_every': 200,  # Densify every x iterations
+        'lambda_ssim': 0.3,  # Weight for SSIM loss (x SSIM, 1-x L1)
     }
     
     data_dir = "/media/ee904/DATA1/ITRI_58/2025-03-10-10-48-26-b58-lidar-camera-ptp/itri58_colored_pcd"
