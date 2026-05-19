@@ -245,11 +245,11 @@ class Trainer:
         # Setup strategy
         self.strategy = DefaultStrategy(
             prune_opa=config.get('prune_opa', 0.005),
-            grow_grad2d=config.get('grow_grad2d', 0.00005),
-            grow_scale3d=config.get('grow_scale3d', 0.01),
+            grow_grad2d=config.get('grow_grad2d', 0.0001),
+            grow_scale3d=config.get('grow_scale3d', 0.001),
             grow_scale2d=config.get('grow_scale2d', 0.03),
             prune_scale3d=config.get('prune_scale3d', 0.15),
-            prune_scale2d=config.get('prune_scale2d', 0.50),
+            prune_scale2d=config.get('prune_scale2d', 0.20),
             refine_start_iter=config.get('refine_start_iter', 500),
             refine_stop_iter=config.get('refine_stop_iter', 15000),
             refine_every=config.get('refine_every', 100),
@@ -282,7 +282,8 @@ class Trainer:
         K_batch = K.unsqueeze(0)
         viewmat_batch = viewmat.unsqueeze(0)
 
-        image_rgb, render_alphas, info = rasterization(
+        # render_mode "RGB+ED" → 4-channel output: [RGB, expected_depth]
+        render_features, render_alphas, info = rasterization(
             means=means,
             quats=quats,
             scales=scales,
@@ -295,14 +296,18 @@ class Trainer:
             packed=False,
             near_plane=0.01,
             far_plane=1000.0,
+            render_mode="RGB+ED",
         )
 
         self.last_info = info
 
-        # Composite with black background
-        image_rgb = image_rgb[0] + (1.0 - render_alphas[0]) * 0.0
+        image_rgb = render_features[0, ..., :3]   # (H, W, 3)
+        image_depth = render_features[0, ..., 3]  # (H, W) expected depth
 
-        return image_rgb.permute(2, 0, 1)
+        # Composite with black background
+        image_rgb = image_rgb + (1.0 - render_alphas[0]) * 0.0
+
+        return image_rgb.permute(2, 0, 1), image_depth
     
     def train_step(self, frame_indices: np.ndarray) -> float:
         """Run one training step."""
@@ -313,6 +318,8 @@ class Trainer:
         total_loss = 0.0
         num_frames = len(frame_indices)
         lambda_ssim = self.config.get('lambda_ssim', 0.2)
+        lambda_depth = self.config.get('lambda_depth', 0.1)
+        da3_conf_threshold = self.config.get('da3_conf_threshold', 0.0)
 
         # Render all frames in batch
         for frame_idx in frame_indices:
@@ -322,7 +329,7 @@ class Trainer:
             pose_c2w = self.poses_c2w[frame_idx]
 
             # Render
-            rendered_rgb = self.rasterize_splats(
+            rendered_rgb, rendered_depth = self.rasterize_splats(
                 pose_c2w,
                 self.K,
                 self.dataset.image_width,
@@ -333,12 +340,43 @@ class Trainer:
             l1_val = F.l1_loss(rendered_rgb, target_image)
             ssim_val = ssim(rendered_rgb.unsqueeze(0), target_image.unsqueeze(0))
 
-            # Total Loss = (1 - lambda) * L1 + lambda * (1 - SSIM)
-            loss = (1.0 - lambda_ssim) * l1_val + lambda_ssim * (1.0 - ssim_val)
+            # Depth loss: L1 on DA3 dense predicted depth (LiDAR pcd is sparse and
+            # sees through walls, giving wrong depth — DA3 dense depth avoids that)
+            da3_depth, da3_conf = self.dataset.get_da3_depth(frame_idx, device=self.device)
+            if da3_depth is not None:
+                valid_depth_mask = (da3_depth > 0)
+                if da3_conf_threshold > 0:
+                    valid_depth_mask = valid_depth_mask & (da3_conf > da3_conf_threshold)
+                if valid_depth_mask.any():
+                    depth_loss_val = F.l1_loss(rendered_depth[valid_depth_mask], da3_depth[valid_depth_mask])
+                else:
+                    depth_loss_val = torch.tensor(0.0, device=self.device)
+            else:
+                depth_loss_val = torch.tensor(0.0, device=self.device)
+
+            # Total Loss = (1 - lambda) * L1 + lambda * (1 - SSIM) + lambda_depth * depth
+            loss = (1.0 - lambda_ssim) * l1_val + lambda_ssim * (1.0 - ssim_val) + lambda_depth * depth_loss_val
             total_loss += loss
         
         total_loss = total_loss / num_frames
-        
+
+        # --- Gaussian shape regularization ---
+        scales = torch.exp(self.splats["scales"])  # [N, 3] actual sizes (meters)
+        max_size = self.config.get('max_size', 0.3)
+        elongate_ratio = self.config.get('elongate_ratio', 5.0)
+        lambda_size = self.config.get('lambda_size', 0.1)
+        lambda_elongate = self.config.get('lambda_elongate', 0.1)
+
+        # Size loss: punish any axis larger than max_size
+        size_loss = F.relu(scales - max_size).mean()
+
+        # Elongate loss: punish long axis > elongate_ratio * short axis
+        long_axis = scales.max(dim=1).values
+        short_axis = scales.min(dim=1).values
+        elongate_loss = F.relu(long_axis - elongate_ratio * short_axis).mean()
+
+        total_loss = total_loss + lambda_size * size_loss + lambda_elongate * elongate_loss
+
         # Pre-backward step
         self.strategy.step_pre_backward(
             params=self.splats,
@@ -519,13 +557,19 @@ if __name__ == "__main__":
         'checkpoint_interval': 10,
         'init_scale_lidar': 0.07,    # Size in meters for LiDAR points
         'init_scale_sky': 0.5,
-        'init_opacity': 0.7,
-        'refine_start_iter': 499,  # Start densification at iteration x
+        'init_opacity': 0.5,
+        'refine_start_iter': 399,  # Start densification at iteration x
         'refine_stop_iter': 25001,  # Stop densification at iteration x
-        'refine_every': 500,  # Densify every x iterations
-        'reset_every': 1500000,  # Reset Gaussians every x iterations
+        'refine_every': 400,  # Densify every x iterations
+        'reset_every': 9999999,  # Reset Gaussians every x iterations
         'pause_refine_after_reset': 0, 
         'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
+        'lambda_depth': 0.05,  # Weight for DA3 depth L1 loss
+        'da3_conf_threshold': 0.0,  # Min DA3 confidence to include pixel (0 = use all)
+        'lambda_size': 0.1,  # Weight for size regularization loss
+        'lambda_elongate': 0.1,  # Weight for elongation regularization loss
+        'max_size': 0.3,  # Punish gaussian axis larger than this (meters)
+        'elongate_ratio': 5.0,  # Punish long axis > this * short axis
         'pointcloud_file': 'Track3_lidar_da3_merge.pcd',  # Change to your pointcloud filename
         'checkpoint_path': None, # Set to None if starting fresh
     }
@@ -539,6 +583,6 @@ if __name__ == "__main__":
     if ckpt and os.path.exists(ckpt):
         trainer.load_checkpoint(ckpt)
 
-    trainer.train(num_epochs=50, batch_size=8)
-    trainer.save_ply("track3_da3_2.ply")
+    trainer.train(num_epochs=50, batch_size=12)
+    trainer.save_ply("track3_da3_4.ply")
     print("\nTraining complete!")

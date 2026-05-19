@@ -23,6 +23,7 @@ track3/
 *.ckp
 *.jpg
 *.png
+*.mp4
 
 # System
 .DS_Store

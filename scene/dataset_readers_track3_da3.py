@@ -14,13 +14,15 @@ from pathlib import Path
 
 
 class Dataset:
-    def __init__(self, data_dir, pointcloud_file="Track3_lidar_da3_merge.pcd"):
+    def __init__(self, data_dir, pointcloud_file="Track3_lidar_da3_merge.pcd",
+                 da3_depth_dir="da3_depth_all"):
         """
         Initialize dataset.
 
         Args:
             data_dir: Root directory containing dataset
             pointcloud_file: Name of pointcloud file to load (relative to data_dir)
+            da3_depth_dir: Directory of DA3 predicted dense depth .npz files
         """
         self.data_dir = Path(data_dir)
         self.image_dir = self.data_dir / "image_all"
@@ -28,6 +30,7 @@ class Dataset:
         self.intrinsics_file = self.data_dir / "camera_intrinsics.json"
         self.pointcloud_file = self.data_dir / pointcloud_file
         self.sky_mask_dir = self.data_dir / "sky_masks"
+        self.da3_depth_dir = self.data_dir / da3_depth_dir
 
         # Load data
         self._load_intrinsics()
@@ -153,6 +156,26 @@ class Dataset:
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         return torch.from_numpy(mask)
+
+    def get_da3_depth(self, frame_idx, device="cuda"):
+        """Load DA3 predicted dense depth + confidence for a frame.
+
+        Returns:
+            (depth, conf) as (H, W) torch tensors, or (None, None) if missing.
+        """
+        if not self.da3_depth_dir.exists():
+            return None, None
+
+        timestamp_str = str(self.timestamps[self.valid_pose_indices[frame_idx]])
+        npz_path = self.da3_depth_dir / f"{timestamp_str}.npz"
+
+        if not npz_path.exists():
+            return None, None
+
+        data = np.load(npz_path)
+        depth = torch.from_numpy(data['depth']).float().to(device)
+        conf = torch.from_numpy(data['conf']).float().to(device)
+        return depth, conf
 
     def get_lidar_depth(self, frame_idx, device="cuda"):
         """Project point cloud into camera frame to create sparse depth map."""
