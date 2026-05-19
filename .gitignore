@@ -11,10 +11,18 @@ data/
 output/
 output_test/
 output_v2/
+output_track1/
+output_track2/
+output_track3/
+track1/
+track2/
+track3/
 *.ply
 *.zip
 *.pt
 *.ckp
+*.jpg
+*.png
 
 # System
 .DS_Store
