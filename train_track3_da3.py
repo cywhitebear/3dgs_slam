@@ -559,7 +559,7 @@ if __name__ == "__main__":
         'init_scale_sky': 0.5,
         'init_opacity': 0.7,
         'refine_start_iter': 399,  # Start densification at iteration x
-        'refine_stop_iter': 20001,  # Stop densification at iteration x
+        'refine_stop_iter': 10001,  # Stop densification at iteration x
         'refine_every': 25,  # Densify every x iterations
         'reset_every': 9999999,  # Reset Gaussians every x iterations
         'pause_refine_after_reset': 0, 
@@ -583,6 +583,6 @@ if __name__ == "__main__":
     if ckpt and os.path.exists(ckpt):
         trainer.load_checkpoint(ckpt)
 
-    trainer.train(num_epochs=100, batch_size=12)
-    trainer.save_ply("track3_da3_6.ply")
+    trainer.train(num_epochs=30, batch_size=12)
+    trainer.save_ply("track3_da3_7.ply")
     print("\nTraining complete!")
