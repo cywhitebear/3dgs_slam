@@ -128,7 +128,7 @@ def create_gaussians_with_optimizers(
     
     return splats, optimizers
 
-def generate_sky_points(dataset, num_points=100000, depth_range=(60.0, 90.0), device="cuda"):
+def generate_sky_points(dataset, num_points=100000, depth_range=(50.0, 80.0), device="cuda"):
     """Generate 3D points for sky regions using sky mask and unprojection."""
     all_points = []
     all_colors = []
@@ -245,11 +245,11 @@ class Trainer:
         # Setup strategy
         self.strategy = DefaultStrategy(
             prune_opa=config.get('prune_opa', 0.005),
-            grow_grad2d=config.get('grow_grad2d', 0.0001),
-            grow_scale3d=config.get('grow_scale3d', 0.001),
+            grow_grad2d=config.get('grow_grad2d', 0.00005),
+            grow_scale3d=config.get('grow_scale3d', 0.01),
             grow_scale2d=config.get('grow_scale2d', 0.03),
             prune_scale3d=config.get('prune_scale3d', 0.15),
-            prune_scale2d=config.get('prune_scale2d', 0.20),
+            prune_scale2d=config.get('prune_scale2d', 0.30),
             refine_start_iter=config.get('refine_start_iter', 500),
             refine_stop_iter=config.get('refine_stop_iter', 15000),
             refine_every=config.get('refine_every', 100),
@@ -551,21 +551,21 @@ if __name__ == "__main__":
         'lr_xyz': 0.00016,
         'lr_color': 0.0025,
         'lr_opacity': 0.05,
-        'lr_scaling': 0.005,
+        'lr_scaling': 0.001,
         'lr_rotation': 0.001,
         'lr_decay': 0.9999,
         'checkpoint_interval': 10,
         'init_scale_lidar': 0.07,    # Size in meters for LiDAR points
         'init_scale_sky': 0.5,
-        'init_opacity': 0.5,
+        'init_opacity': 0.7,
         'refine_start_iter': 399,  # Start densification at iteration x
-        'refine_stop_iter': 25001,  # Stop densification at iteration x
-        'refine_every': 400,  # Densify every x iterations
+        'refine_stop_iter': 20001,  # Stop densification at iteration x
+        'refine_every': 25,  # Densify every x iterations
         'reset_every': 9999999,  # Reset Gaussians every x iterations
         'pause_refine_after_reset': 0, 
         'lambda_ssim': 0.2,  # Weight for SSIM loss (x SSIM, 1-x L1)
         'lambda_depth': 0.05,  # Weight for DA3 depth L1 loss
-        'da3_conf_threshold': 0.0,  # Min DA3 confidence to include pixel (0 = use all)
+        'da3_conf_threshold': 0.1,  # Min DA3 confidence to include pixel (0 = use all)
         'lambda_size': 0.1,  # Weight for size regularization loss
         'lambda_elongate': 0.1,  # Weight for elongation regularization loss
         'max_size': 0.3,  # Punish gaussian axis larger than this (meters)
@@ -583,6 +583,6 @@ if __name__ == "__main__":
     if ckpt and os.path.exists(ckpt):
         trainer.load_checkpoint(ckpt)
 
-    trainer.train(num_epochs=50, batch_size=12)
-    trainer.save_ply("track3_da3_4.ply")
+    trainer.train(num_epochs=100, batch_size=12)
+    trainer.save_ply("track3_da3_6.ply")
     print("\nTraining complete!")
